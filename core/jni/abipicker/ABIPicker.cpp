@@ -569,8 +569,8 @@ bool ABIPicker::buildNativeLibList(void* apkHandle) {
             break;
         }
 
-        if (unCompLen == 0) {
-            ALOGV("skip a empty file(%s)\n", fileName);
+        if (unCompLen < 20) {
+            ALOGV("skip a empty or too small file(%s)\n", fileName);
             continue;
         }
 
@@ -586,7 +586,7 @@ bool ABIPicker::buildNativeLibList(void* apkHandle) {
             break;
         }
         memset(unCompBuff, 0, unCompLen);
-        // THE MOST TIME COST OPERATION
+        // TODO: just uncompress 20 bytes
         if (!zipFile->uncompressEntry(next, unCompBuff, unCompLen)) {
             ALOGE("%s: uncompress failed\n", fileName);
             ret = false;
