@@ -3,9 +3,14 @@
 #include "ABIPicker.h"
 #include "ELFLite.h"
 
+#include <fnmatch.h>
+
+#include <zlib.h>
+
+#define private public
 #include <androidfw/ZipFileRO.h>
 #include <androidfw/ZipUtils.h>
-#include <fnmatch.h>
+#undef private
 
 namespace android {
 #define ARR_SIZE(x)     (sizeof(x)/sizeof(x[0]))
@@ -528,6 +533,102 @@ ABIPicker::~ABIPicker(void) {
     delete mLibList;
 }
 
+static bool CopyEntryToBuffer(const int fd, void* buffer, size_t size){
+    return read(fd, buffer, size) == size;
+}
+
+static bool InflateEntryToBuffer(const int fd, uint32_t compLen, void* buffer, size_t size){
+    const size_t kBufSize = 1024;
+    unsigned char read_buf[kBufSize];
+    z_stream zstream;
+    int zerr;
+    
+    /*
+     * Initialize the zlib stream struct.
+     */
+    memset(&zstream, 0, sizeof(zstream));
+    zstream.zalloc = Z_NULL;
+    zstream.zfree = Z_NULL;
+    zstream.opaque = Z_NULL;
+    zstream.next_in = NULL;
+    zstream.avail_in = 0;
+    zstream.next_out = (unsigned char*)buffer;
+    zstream.avail_out = size;
+    zstream.data_type = Z_UNKNOWN;
+    
+    /*
+     * Use the undocumented "negative window bits" feature to tell zlib
+     * that there's no zlib header waiting for it.
+     */
+    zerr = inflateInit2(&zstream, -MAX_WBITS);
+    if (zerr != Z_OK) {
+        if (zerr == Z_VERSION_ERROR) {
+            ALOGE("Installed zlib is not compatible with linked version (%s)",
+                  ZLIB_VERSION);
+        } else {
+            ALOGW("Call to inflateInit2 failed (zerr=%d)", zerr);
+        }
+        
+        inflateEnd(&zstream);
+        return false;
+    }
+    
+    const uint32_t uncompressed_length = size;
+    
+    uint32_t compressed_length = compLen;
+    do {
+        /* read as much as we can */
+        if (zstream.avail_in == 0) {
+            const ZD_TYPE getSize = (compressed_length > kBufSize) ? kBufSize : compressed_length;
+            const ZD_TYPE actual = TEMP_FAILURE_RETRY(read(fd, &read_buf[0], getSize));
+            if (actual != getSize) {
+                ALOGW("Zip: inflate read failed (" ZD " vs " ZD ")", actual, getSize);
+                zerr = Z_DATA_ERROR;
+                break;
+            }
+            
+            compressed_length -= getSize;
+            
+            zstream.next_in = read_buf;
+            zstream.avail_in = getSize;
+        }
+        
+        /* uncompress the data */
+        zerr = inflate(&zstream, Z_NO_FLUSH);
+        if (zerr != Z_OK && zerr != Z_STREAM_END) {
+            ALOGW("Zip: inflate zerr=%d (nIn=%p aIn=%u nOut=%p aOut=%u)",
+                  zerr, zstream.next_in, zstream.avail_in,
+                  zstream.next_out, zstream.avail_out);
+            break;
+        }
+        
+        /* write when we're full or when we're done */
+        if (zstream.avail_out == 0 || zerr == Z_STREAM_END) {
+            zerr = Z_STREAM_END;
+            break;
+        }
+    } while (zerr == Z_OK);
+    
+    inflateEnd(&zstream);
+    
+    return Z_STREAM_END == zerr;
+}
+
+static bool uncompressEntry(const int fd, uint16_t method, uint32_t compLen, off64_t offset, void* buffer, size_t size)
+{
+    if (lseek64(fd, offset, SEEK_SET) != offset) {
+        return false;
+    }
+
+    if (method == kCompressStored) {
+        return CopyEntryToBuffer(fd, buffer, size);
+    } else if (method == kCompressDeflated) {
+        return InflateEntryToBuffer(fd, compLen, buffer, size);
+    }
+
+    return false;
+}
+
 bool ABIPicker::buildNativeLibList(void* apkHandle) {
     bool ret = false;
 
@@ -546,6 +647,11 @@ bool ABIPicker::buildNativeLibList(void* apkHandle) {
     ZipEntryRO next = NULL;
     char* unCompBuff = NULL;
     char fileName[SO_NAME_MAX + 1];
+    uint16_t method;
+    uint32_t compLen;
+    off64_t offset;
+    int* archive;
+    int fd;
     while ((next = zipFile->nextEntry(cookie))) {
         if (zipFile->getEntryFileName(next, fileName, SO_NAME_MAX)) {
             ALOGE("apk file is broken, can not get entry name\n");
@@ -562,7 +668,7 @@ bool ABIPicker::buildNativeLibList(void* apkHandle) {
 
         // find out any invalid ELF file
         uint32_t unCompLen = 0;
-        if (!zipFile->getEntryInfo(next, NULL, &unCompLen, NULL, NULL, NULL,
+        if (!zipFile->getEntryInfo(next, &method, &unCompLen, &compLen, &offset, NULL,
                                     NULL)) {
             ALOGE("apk file is broken, can not get entry info\n");
             ret = false;
@@ -579,6 +685,7 @@ bool ABIPicker::buildNativeLibList(void* apkHandle) {
             unCompBuff = NULL;
         }
 
+        unCompLen = 20;
         unCompBuff = (char*)malloc(unCompLen);
         if (unCompBuff == NULL) {
             ALOGE("malloc failed size %d\n", unCompLen);
@@ -586,8 +693,10 @@ bool ABIPicker::buildNativeLibList(void* apkHandle) {
             break;
         }
         memset(unCompBuff, 0, unCompLen);
-        // TODO: just uncompress 20 bytes
-        if (!zipFile->uncompressEntry(next, unCompBuff, unCompLen)) {
+
+        archive = (int*)(zip->mHandle);
+        fd = archive[0];
+        if (!uncompressEntry(fd, method, compLen, offset, unCompBuff, unCompLen)) {
             ALOGE("%s: uncompress failed\n", fileName);
             ret = false;
             break;
