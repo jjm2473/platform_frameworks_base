@@ -694,7 +694,7 @@ bool ABIPicker::buildNativeLibList(void* apkHandle) {
         }
         memset(unCompBuff, 0, unCompLen);
 
-        archive = (int*)(zip->mHandle);
+        archive = (int*)(zipFile->mHandle);
         fd = archive[0];
         if (!uncompressEntry(fd, method, compLen, offset, unCompBuff, unCompLen)) {
             ALOGE("%s: uncompress failed\n", fileName);
